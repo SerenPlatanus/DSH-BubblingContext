@@ -1,0 +1,22 @@
+{
+  "name": "dsh-bubbling-context",
+  "version": "0.1.0",
+  "description": "BubblingContext: DSH trajectory visualization panel",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": { ".": "./src/index.js", "./client": "./lib/client.js" },
+  "files": ["src/index.js", "lib", "cordis.patch.yml"],
+  "scripts": { "build": "node scripts/build.mjs", "prepare": "npm run build" },
+  "engines": { "node": ">=22.19" },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  }
+}
