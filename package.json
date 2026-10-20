@@ -1,13 +1,14 @@
 {
   "name": "dsh-bubbling-context",
-  "version": "0.2.0",
+  "version": "0.4.1",
   "description": "BubblingContext: DSH trajectory visualization panel",
   "type": "module",
   "main": "./src/index.js",
-  "exports": { ".": "./src/index.js", "./client": "./lib/client.js", "./package.json": "./package.json", "./cordis.patch.yml": "./cordis.patch.yml" },
+  "exports": { ".": "./src/index.js", "./client": "./lib/client.js", "./context-source": "./src/context-source.cjs", "./package.json": "./package.json", "./cordis.patch.yml": "./cordis.patch.yml" },
   "files": ["src", "scripts", "lib", "cordis.patch.yml"],
-  "scripts": { "build": "node scripts/build.mjs", "prepare": "npm run build" },
+  "scripts": { "build": "node scripts/build.mjs", "prepare": "npm run build", "test": "node --test tests/*.test.cjs" },
   "engines": { "node": ">=22.19" },
+  "peerDependencies": { "zod": "^4.0.0" },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {

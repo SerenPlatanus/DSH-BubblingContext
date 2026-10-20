@@ -1,5 +1,8 @@
 const React = require('react');
 const trajectory = require('./trajectory.cjs');
+const branchTools = require('./branches.cjs');
+const graphState = require('./graph-state.cjs');
+const {createContextRegistry,mergeContexts} = require('./context-source.cjs');
 const h = React.createElement;
 const { useState, useEffect, useMemo, useRef } = React;
 const { COLORS, LABELS, buildNodes, graphLayout, stringify } = trajectory;
@@ -34,8 +37,8 @@ function useEvolution(nodes, requestKey, reduced) {
   useEffect(()=>{
     if(!initialized.current && nodes.length){initialized.current=true;known.current=new Set(nodes.map(n=>n.id));setVisible(new Set(known.current));lastRequest.current=requestKey;return;}
     // Paging backwards reveals older history directly; it is not a new call.
-    const firstKnown=nodes.find(n=>known.current.has(n.id));
-    const older=firstKnown?nodes.filter(n=>!known.current.has(n.id)&&n.seq<firstKnown.seq):[];
+    const firstKnown=new Map();for(const n of nodes)if(known.current.has(n.id)&&!firstKnown.has(n.agentId||'main'))firstKnown.set(n.agentId||'main',n);
+    const older=nodes.filter(n=>!known.current.has(n.id)&&firstKnown.has(n.agentId||'main')&&n.seq<firstKnown.get(n.agentId||'main').seq);
     if(older.length){for(const n of older)known.current.add(n.id);setVisible(new Set(known.current));}
     const fresh=nodes.filter(n=>!known.current.has(n.id));
     const changed=lastRequest.current!==requestKey;lastRequest.current=requestKey;
@@ -70,26 +73,84 @@ function Details({node,onClose}){
     node.extra&&h('details',null,h('summary',null,'查看工具定义'),h('pre',null,stringify(node.extra))),
     h('details',null,h('summary',null,`原始轨迹记录 · seq ${node.seq}`),h('pre',null,stringify(node.source))));
 }
-function LiveGraph({useTrajectory,useSession,sessionId,close,loadOlder}){
+function LiveGraph({useTrajectory,useSession,sessionId,close,loadOlder,branchContext,contextSources}){
   const snapshot=useTrajectory(s=>s), session=useSession(s=>s);
-  const nodes=useMemo(()=>buildNodes(snapshot),[snapshot]);
-  const [selected,select]=useState(null),[width,setWidth]=useState(420),[error,setError]=useState(''),[follow,setFollow]=useState(true);
+  const customRecords=React.useSyncExternalStore(fn=>contextSources.subscribe(sessionId,fn),()=>contextSources.getSnapshot(sessionId));
+  const nodes=useMemo(()=>mergeContexts(buildNodes(snapshot),customRecords,trajectory.estimateTokens),[snapshot,customRecords]);
+  const [selected,select]=useState(null),[width,setWidth]=useState(420),[error,setError]=useState('');
+  const cameraRef=useRef({x:0,y:0,scale:1}),drag=useRef(null),cameraStage=useRef(null),zoomLabel=useRef(null),cameraFrame=useRef(null);
+  const camera=cameraRef.current;
+  const [dragging,setDragging]=useState(false);
+  const preferenceKey=`bubbling-context.graph:${sessionId}`;
+  const [edits,setEdits]=useState(()=>{try{return JSON.parse(window.localStorage?.getItem(preferenceKey)||'{}').edits||{};}catch{return{};}});
+  const [collapsed,setCollapsed]=useState(()=>{try{return JSON.parse(window.localStorage?.getItem(preferenceKey)||'{}').collapsed||{};}catch{return{};}});
+  const editsRef=useRef(edits);editsRef.current=edits;
+  useEffect(()=>{try{window.localStorage?.setItem(preferenceKey,JSON.stringify({edits,collapsed}));}catch{}},[edits,collapsed,preferenceKey]);
+  function toggleAgent(id){setCollapsed(value=>({...value,[id]:!value[id]}));}
+  // Camera motion must never reconcile the full SVG tree. Coalesce wheel and
+  // pan input into one compositor transform per animation frame instead.
+  function paintCamera(){
+    cameraFrame.current=null;const value=cameraRef.current;
+    if(cameraStage.current)cameraStage.current.style.transform=`translate3d(${value.x}px, ${value.y}px, 0) scale(${value.scale})`;
+    if(zoomLabel.current)zoomLabel.current.textContent=`${Math.round(value.scale*100)}%`;
+  }
+  function updateCamera(value){
+    cameraRef.current=value;
+    if(cameraFrame.current==null)cameraFrame.current=window.requestAnimationFrame?window.requestAnimationFrame(paintCamera):setTimeout(paintCamera,16);
+  }
+  useEffect(()=>()=>{if(cameraFrame.current!=null){if(window.cancelAnimationFrame)window.cancelAnimationFrame(cameraFrame.current);else clearTimeout(cameraFrame.current);}},[]);
   const [layoutMode,setLayoutMode]=useState(()=>{try{return window.localStorage?.getItem('bubbling-context.layout')==='snake'?'snake':'straight';}catch{return 'straight';}});
+  const [branchState,setBranchState]=useState({branches:[],errors:[]});
+  useEffect(()=>{if(layoutMode!=='straight')return;return branchTools.watchBranches(branchContext,sessionId,setBranchState,(snapshot,id)=>mergeContexts(buildNodes(snapshot),contextSources.getSnapshot(id),trajectory.estimateTokens),contextSources);},[layoutMode,sessionId,branchContext,contextSources]);
   const [reduced,setReduced]=useState(()=>window.matchMedia?.('(prefers-reduced-motion: reduce)').matches||false);
   const viewport=useRef(null);
+  useEffect(()=>{
+    const el=viewport.current;if(!el)return;
+    const wheel=e=>{
+      e.preventDefault();const rect=el.getBoundingClientRect(),old=cameraRef.current;
+      const unit=e.deltaMode===1?16:e.deltaMode===2?el.clientHeight:1;
+      const scale=Math.max(.15,Math.min(3,old.scale*Math.exp(-e.deltaY*unit*.0015)));
+      const ratio=scale/old.scale,x=e.clientX-rect.left,y=e.clientY-rect.top;
+      updateCamera({scale,x:x-(x-old.x)*ratio,y:y-(y-old.y)*ratio});
+    };
+    el.addEventListener('wheel',wheel,{passive:false});return()=>el.removeEventListener('wheel',wheel);
+  },[]);
+  function startDrag(e){
+    if(e.button===1&&e.target.matches?.('circle.bc-bubble')){
+      const owner=e.target.closest('.bc-node'),id=owner?.getAttribute('data-drag-id');if(!id)return;
+      e.preventDefault();drag.current={kind:'node',nodeId:id,id:e.pointerId,x:e.clientX,y:e.clientY,scale:cameraRef.current.scale,edit:{...(editsRef.current[id]||{x:0,y:0})}};
+      e.currentTarget.setPointerCapture?.(e.pointerId);setDragging(true);return;
+    }
+    if(e.button!==0||e.target.closest?.('.bc-node'))return;
+    e.preventDefault();drag.current={id:e.pointerId,x:e.clientX,y:e.clientY,camera:{...cameraRef.current}};
+    e.currentTarget.setPointerCapture?.(e.pointerId);setDragging(true);
+  }
+  function moveDrag(e){const d=drag.current;if(!d||d.id!==e.pointerId)return;if(d.kind==='node'){
+    const value={...editsRef.current,[d.nodeId]:{x:d.edit.x+(e.clientX-d.x)/d.scale,y:d.edit.y+(e.clientY-d.y)/d.scale}};editsRef.current=value;setEdits(value);return;
+  }updateCamera({...d.camera,x:d.camera.x+e.clientX-d.x,y:d.camera.y+e.clientY-d.y});}
+  function endDrag(e){if(drag.current?.id!==e.pointerId)return;drag.current=null;setDragging(false);if(e.currentTarget.hasPointerCapture?.(e.pointerId))e.currentTarget.releasePointerCapture(e.pointerId);}
   useEffect(()=>{const media=window.matchMedia?.('(prefers-reduced-motion: reduce)');if(!media)return;const update=()=>setReduced(media.matches);media.addEventListener('change',update);return()=>media.removeEventListener('change',update);},[]);
   useEffect(()=>{if(!viewport.current)return;const observer=new ResizeObserver(entries=>setWidth(Math.max(260,entries[0].contentRect.width)));observer.observe(viewport.current);return()=>observer.disconnect();},[]);
   const request=(snapshot?.requests||[]).filter(r=>r.purpose==='assistant').at(-1);
-  const {visible,wave,born}=useEvolution(nodes,request?String(request.startSeq):'',reduced);
-  const shown=nodes.filter(n=>visible.has(n.id)),layout=graphLayout(shown,width,layoutMode),points=layout.points;
+  const branches=useMemo(()=>branchState.branches.map(b=>({...b,parentId:b.parentId===sessionId?'root':b.parentId})),[branchState.branches,sessionId]);
+  const composite=useMemo(()=>layoutMode==='straight'&&branches.length?branchTools.branchLayout(nodes,branches,width,graphLayout):null,[layoutMode,branches,nodes,width]);
+  const allNodes=composite?composite.points:nodes;
+  const requestKey=(request?String(request.startSeq):'')+(composite?'|'+composite.lanes.map(l=>l.points.filter(n=>n.kind==='assistant').at(-1)?.id||'').join('|'):'');
+  const {visible,wave,born}=useEvolution(allNodes,requestKey,reduced);
+  const baseLayout=useMemo(()=>composite||graphLayout(allNodes,width,layoutMode),[composite,allNodes,width,layoutMode]);
+  const movedLayout=useMemo(()=>graphState.transformGraph(baseLayout,edits),[baseLayout,edits]);
+  const displayLayout=useMemo(()=>graphState.collapseGraph(movedLayout,collapsed),[movedLayout,collapsed]);
+  const points=useMemo(()=>displayLayout.points.filter(p=>p.collapsedAgentId||visible.has(p.id)),[displayLayout,visible]);
+  const layout={...displayLayout,points};
   const waveIndex=new Map((wave?.ids||[]).map((id,i)=>[id,i]));
-  useEffect(()=>{if(follow&&viewport.current)viewport.current.scrollTop=viewport.current.scrollHeight;},[shown.length,follow,layoutMode]);
   function path(a,b){const dx=b.x-a.x,dy=b.y-a.y,length=Math.hypot(dx,dy)||1;return `M ${a.x+dx*a.radius/length} ${a.y+dy*a.radius/length} L ${b.x-dx*b.radius/length} ${b.y-dy*b.radius/length}`;}
   const symbols={system:'S',user:'U',context:'C',assistant:'A',tool:'T'};
-  const wires=points.slice(1).map((p,i)=>h('path',{key:`line:${p.id}`,d:path(points[i],p),className:'bc-link'}));
-  const flashes=wave?points.slice(1).filter(p=>waveIndex.has(p.id)).map(p=>{const i=points.findIndex(x=>x.id===p.id);return h('path',{key:`flash:${wave.stamp}:${p.id}`,d:path(points[i-1],p),className:'bc-wire-wave',style:{animationDelay:`${waveIndex.get(p.id)*wave.duration/Math.max(1,wave.ids.length)}ms`}});}):[];
-  const bubbles=points.map((p,i)=>h('g',{key:p.id,role:'button',tabIndex:0,className:`bc-node ${born.has(p.id)?'bc-new':''}`,'aria-label':`${LABELS[p.kind]}：${p.title}，${p.estimated?'估算':''}${p.tokens} tokens`,'aria-pressed':selected===p.id,
-    onClick:()=>select(p.id),onKeyDown:e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();select(p.id);}}},
+  const connections=points.slice(1).flatMap((p,i)=>!composite||points[i].agentId===p.agentId?[{from:points[i],to:p}]:[]);
+  if(composite){const shownIds=new Set(points.map(p=>p.id));connections.push(...layout.links.filter(l=>shownIds.has(l.from.id)&&shownIds.has(l.to.id)));}
+  const wires=connections.map(c=>h('path',{key:`line:${c.kind||'chain'}:${c.from.id}:${c.to.id}`,d:path(c.from,c.to),className:'bc-link',style:c.kind==='creation'?{stroke:'#e49628',strokeOpacity:.95,strokeWidth:1.8}:undefined,strokeDasharray:c.kind==='fork'?'4 3':undefined,'data-bc':c.kind==='fork'?'fork-link':c.kind==='creation'?'creation-link':'chain-link'}));
+  const flashes=wave?connections.filter(c=>waveIndex.has(c.to.id)).map(c=>h('path',{key:`flash:${wave.stamp}:${c.kind||'chain'}:${c.from.id}:${c.to.id}`,d:path(c.from,c.to),className:'bc-wire-wave',style:{stroke:c.kind==='creation'?'#ffd27d':undefined,animationDelay:`${waveIndex.get(c.to.id)*wave.duration/Math.max(1,wave.ids.length)}ms`}})):[];
+  const bubbles=points.map((p,i)=>h('g',{key:p.id,role:'button',tabIndex:0,className:`bc-node ${born.has(p.id)?'bc-new':''}`,'data-drag-id':p.dragId||p.id,'aria-label':`${LABELS[p.kind]}：${p.title}，${p.estimated?'估算':''}${p.tokens} tokens`,'aria-pressed':selected===p.id,
+    onClick:()=>{if(p.collapsedAgentId)toggleAgent(p.collapsedAgentId);else select(p.id);},onKeyDown:e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();if(p.collapsedAgentId)toggleAgent(p.collapsedAgentId);else select(p.id);}}},
     h('title',null,`${p.title}\n${p.estimated?'≈':''}${fmt(p.tokens)} tokens · 累计 ≈${fmt(p.cumulative)}${p.usage?.cacheRead!=null?' · 缓存 '+fmt(p.usage.cacheRead):''}\n${p.text.slice(0,160)}`),
     h('circle',{key:waveIndex.has(p.id)?`pulse:${wave.stamp}`:'bubble',cx:p.x,cy:p.y,r:p.radius,fill:p.color,className:`bc-bubble ${waveIndex.has(p.id)?'bc-wave':''}`,style:waveIndex.has(p.id)?{animationDelay:`${waveIndex.get(p.id)*wave.duration/Math.max(1,wave.ids.length)}ms`}:{}}),
     h('text',{x:p.x,y:p.y+(p.radius<=12?3:4),className:'bc-symbol',style:p.radius<=12?{fontSize:9}:{}},symbols[p.kind]),
@@ -102,20 +163,35 @@ function LiveGraph({useTrajectory,useSession,sessionId,close,loadOlder}){
   return h('section',{className:'bc-panel','aria-label':'BubblingContext 轨迹可视化','data-testid':'bubbling-context-panel'},
     h('header',{className:'bc-heading'},h(BubbleIcon),h('h2',null,'BubblingContext'),h('select',{className:'bc-button','aria-label':'显示类型',title:'显示类型',value:layoutMode,onChange:e=>{const mode=e.target.value;setLayoutMode(mode);try{window.localStorage?.setItem('bubbling-context.layout',mode);}catch{}}},h('option',{value:'straight'},'直线'),h('option',{value:'snake'},'蛇形')),h('button',{className:'bc-button',onClick:close,'aria-label':'关闭 BubblingContext 面板'},'×')),
     h('div',{className:'bc-legend'},...Object.keys(COLORS).map(kind=>h('span',{key:kind},h('i',{className:'bc-dot',style:{background:COLORS[kind]}}),LABELS[kind]))),
-    h('div',{className:'bc-status'},h('span',{className:session.running?'bc-live':''},wave?'● 高亮传递中':session.running?'● 实时更新中':'● 已同步'),h('span',null,`${shown.length} / ${nodes.length} 个节点`),h('button',{className:'bc-button',onClick:()=>setFollow(v=>!v),'aria-pressed':follow},follow?'跟随最新 ✓':'跟随最新')),
-    session.hasMore&&h('div',{className:'bc-status'},'当前为部分历史',h('button',{className:'bc-button',disabled:session.loadingOlder,onClick:async()=>{try{setError('');setFollow(false);await loadOlder(sessionId);}catch(e){setError(e.message);}}},session.loadingOlder?'加载中…':'加载更早记录')),
+    h('div',{className:'bc-status'},h('span',{className:session.running?'bc-live':''},wave?'● 高亮传递中':session.running?'● 实时更新中':'● 已同步'),h('span',null,`${points.length} / ${allNodes.length} 个节点${composite?' · '+branches.length+' 个 Agent 分支':''}`),h('span',{ref:zoomLabel,'aria-label':'当前缩放比例'},`${Math.round(camera.scale*100)}%`),h('button',{className:'bc-button',onClick:()=>updateCamera({x:0,y:0,scale:1})},'重置视图'),h('button',{className:'bc-button',onClick:()=>{setEdits({});editsRef.current={};}},'重置节点'),h('button',{className:'bc-button',onClick:()=>{const last=points.at(-1);if(!last||!viewport.current)return;updateCamera({...cameraRef.current,x:viewport.current.clientWidth/3-last.x*cameraRef.current.scale,y:viewport.current.clientHeight/2-last.y*cameraRef.current.scale});}},'定位最新')),
+    customRecords.filter(r=>r.error).map(r=>h('div',{className:'bc-error',key:r.sourceId},`${r.sourceId}: ${r.error}`)),
+    customRecords.filter(r=>!r.error&&!buildNodes(snapshot).some(n=>n.id===r.afterNodeId)).length>0&&h('div',{className:'bc-status'},'部分自定义上下文的挂载节点尚未加载。'),
+    layoutMode==='straight'&&branchState.errors.map((message,i)=>h('div',{className:'bc-error',key:i,role:'alert'},message)),
+    layoutMode==='straight'&&!branchState.ready&&h('div',{className:'bc-status'},'Agent 分支服务尚未就绪；更新插件后需重启 DSH。'),
+    layoutMode==='straight'&&branchState.mainMeta&&h('div',{className:'bc-status'},`主 Agent：输入 ${fmt(branchState.mainMeta.usage.input)} · 输出 ${fmt(branchState.mainMeta.usage.output)} · 已报告调用合计 ${fmt(branchState.mainMeta.usage.total)} tok`),
+    composite&&h('div',{style:{maxHeight:130,overflow:'auto',padding:'0 16px 8px',fontSize:11}},...composite.lanes.filter(l=>l.id!=='main').map(l=>h('div',{key:l.id,style:{border:'1px solid #ffffff20',padding:6,marginBottom:4,borderRadius:5}},
+      h('strong',null,`${l.isFork===null?'来源待加载':l.isFork?'Fork · 继承上下文':'子 Agent · 独立上下文'}：${l.label} · ${l.running?'运行中':'空闲'}`),
+      h('button',{className:'bc-button','aria-expanded':!collapsed[l.id],onClick:()=>toggleAgent(l.id)},collapsed[l.id]?'展开':'折叠'),
+      h('div',null,`新增输入 ${fmt(l.meta?.usage?.input)} · 输出 ${fmt(l.meta?.usage?.output)} · 缓存读取 ${l.meta?.usage?.cacheReported?fmt(l.meta.usage.cacheRead):'未报告'} · 调用合计 ${fmt(l.meta?.usage?.total)}`),
+      l.isFork&&h('div',null,`继承前缀：${fmt(l.meta?.inheritedEventCount)} 条事件 · 已加载内容 ≈${fmt(l.inheritTokens)} tok（不重复计入新增用量）`),
+      l.hasMore&&h('button',{className:'bc-button',onClick:async()=>{try{await loadOlder(l.id);}catch(e){setError(e.message);}}},'加载该 Agent 更早记录')))),
+    composite&&composite.unresolved.length>0&&h('div',{className:'bc-status'},composite.unresolved.join('；')),
+    session.hasMore&&h('div',{className:'bc-status'},'当前为部分历史',h('button',{className:'bc-button',disabled:session.loadingOlder,onClick:async()=>{try{setError('');await loadOlder(sessionId);}catch(e){setError(e.message);}}},session.loadingOlder?'加载中…':'加载更早记录')),
     error&&h('div',{className:'bc-error',role:'alert'},error),
-    h('div',{className:'bc-canvas',ref:viewport},nodes.length?h('svg',{viewBox:`0 0 ${width} ${layout.height}`,height:layout.height,role:'group','aria-label':'实时上下文演进图'},...wires,...flashes,...bubbles):h('div',{className:'bc-empty'},h('strong',null,'等待第一颗气泡'),'开始对话后，上下文与调用会沿白色连线依次浮现。')),
-    h(Details,{node:nodes.find(n=>n.id===selected),onClose:()=>select(null)}),
+    h('div',{className:'bc-canvas',ref:viewport,title:'左键拖动画布 · 中键拖动圆形节点及下游 · 滚轮缩放',onAuxClick:e=>{if(e.button===1)e.preventDefault();},onPointerDown:startDrag,onPointerMove:moveDrag,onPointerUp:endDrag,onPointerCancel:endDrag,onLostPointerCapture:endDrag,style:{overflow:'hidden',position:'relative',touchAction:'none',userSelect:dragging?'none':undefined,cursor:dragging?'grabbing':'grab'}},allNodes.length?h('div',{ref:cameraStage,'data-bc':'camera-stage',style:{position:'absolute',top:0,left:0,transformOrigin:'0 0',transform:`translate3d(${camera.x}px, ${camera.y}px, 0) scale(${camera.scale})`}},h('svg',{viewBox:`0 0 ${layout.width||width} ${layout.height}`,height:layout.height,style:{width:layout.width||width,minWidth:layout.width||width,overflow:'visible'},role:'group','aria-label':'实时上下文演进图'},
+      ...(composite?layout.lanes.map(l=>h('g',{key:`lane:${l.id}`},h('line',{x1:l.x+8,y1:l.y-14,x2:l.x+8,y2:l.collapsed?l.y+80:layout.height,stroke:'#ffffff15',strokeDasharray:'3 6'}),h('text',{x:l.x+20,y:l.y,fill:'#ccc',fontSize:11,role:l.id==='main'?undefined:'button',tabIndex:l.id==='main'?undefined:0,onClick:()=>{if(l.id!=='main')toggleAgent(l.id);},onKeyDown:e=>{if(l.id!=='main'&&(e.key==='Enter'||e.key===' ')){e.preventDefault();toggleAgent(l.id);}}},l.id==='main'?'主 Agent':`${collapsed[l.id]?'▸':'▾'} ${l.isFork?'Fork':'子 Agent'} · ${l.label.slice(0,24)}`))):[]),...wires,...flashes,...bubbles)):h('div',{className:'bc-empty'},h('strong',null,'等待第一颗气泡'),'开始对话后，上下文与调用会沿白色连线依次浮现。')),
+    h(Details,{node:points.find(n=>n.id===selected),onClose:()=>select(null)}),
     h('footer',{className:'bc-footer'},'≈ 为文本估算。累计从已加载起点计算，不等于实际 KV 缓存或当前窗口。缓存命中仅显示每次调用实报值。'));
 }
 exports.name='bubbling-context-client';
-exports.inject=['slots','sidebarRight','sidebarRightTabs','sessions'];
+exports.inject=['slots','sidebarRight','sidebarRightTabs','sessions','uiConversation'];
 exports.apply=function(ctx){
+  const contextSources=createContextRegistry();
+  ctx.effect(()=>{const off=ctx.reflect.provide('bubblingContextSources',contextSources);return()=>{off();contextSources.dispose();};});
   ctx.effect(()=>{const style=document.createElement('style');style.dataset.bubblingContext='true';style.textContent=css;document.head.appendChild(style);return()=>style.remove();});
   ctx.effect(()=>ctx.sidebarRightTabs.register({id:ID,kind:KIND,title:()=>'BubblingContext',keepMounted:true,guide:[{id:'trajectory',order:25,title:()=>'BubblingContext',description:()=>'实时上下文气泡与调用轨迹',icon:BubbleIcon}]}));
   function OpenButton(){return h('button',{type:'button',className:'bc-trigger',title:'打开 BubblingContext · 轨迹可视化','aria-label':'打开 BubblingContext 轨迹可视化面板','data-testid':'bubbling-context-open',onClick:()=>ctx.sidebarRight.openTab(KIND)},h(BubbleIcon));}
-  function Panel(props){const {tab}=props.useTabInfo();return h(LiveGraph,{...props,key:props.sessionId,close:()=>tab.actions.close(),loadOlder:async id=>{const session=ctx.sessions.binding(id)?.session;if(!session)throw new Error('当前会话不可用');await session.loadOlder();}});}
+  function Panel(props){const {tab}=props.useTabInfo();return h(LiveGraph,{...props,branchContext:ctx,contextSources,key:props.sessionId,close:()=>tab.actions.close(),loadOlder:async id=>{const session=ctx.sessions.binding(id)?.session;if(!session)throw new Error('当前会话不可用');await session.loadOlder();}});}
   ctx.effect(()=>ctx.slots.inject('conversation.session.header.utilities',()=>ctx.slots.register({name:'conversation.session.header.utilities',id:ID,order:-20,registrant:ID},OpenButton)));
   ctx.effect(()=>ctx.slots.inject('sidebar.right.pane.tab',()=>ctx.slots.register({name:'sidebar.right.pane.tab',key:ID},Panel)));
 };
