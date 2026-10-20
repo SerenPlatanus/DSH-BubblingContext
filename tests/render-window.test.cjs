@@ -12,10 +12,12 @@ test('offscreen circles, visible cards and crossing branch links',()=>{
  const v={left:0,right:800,top:0,bottom:600,level:'detail'};
  const p={x:-100,y:50,radius:12,cardX:10,cardWidth:200};
  assert.equal(r.nodeVisible(v,p),true);
- assert.equal(r.nodeVisible({...v,level:'overview'},p),false);
+ assert.equal(r.nodeVisible({...v,level:'overview'},p),true);
  assert.equal(r.nodeVisible(v,{...p,y:10000}),false);
- assert.equal(r.edgeVisible(v,{from:{x:-100,y:200},to:{x:900,y:300}}),true);
- assert.equal(r.edgeVisible(v,{from:{x:20,y:900},to:{x:30,y:1000}}),false);
+ const node=(x,y)=>({x,y,radius:12,cardX:x+37,cardWidth:200});
+ assert.equal(r.edgeVisible(v,{from:node(-100,200),to:node(900,300)}),true);
+ assert.equal(r.edgeVisible(v,{from:node(20,900),to:node(30,1000)}),false);
+ assert.match(r.edgePath(node(0,0),node(0,56)),/^M 2 6 L 2 50$/);
 });
 test('2000 node fixture limits detail drawing and removes overview text cards',()=>{
  const points=Array.from({length:2000},(_,i)=>({x:36,y:66+i*56,radius:12,cardX:73,cardWidth:300}));

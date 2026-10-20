@@ -2,8 +2,11 @@ const LINEAGE_KEY='bubblingContextLineage';
 // Retains read-only child sessions; owns and releases every listener/reference.
 function watchBranches(ctx,rootId,publish,buildNodes,contextSources){
   let stopped=false;
-  const entries=new Map(), pending=new Map(), errors=new Map();
-  function emit(){if(!stopped)publish({ready:!!entries.get(rootId)?.meta,mainMeta:entries.get(rootId)?.meta,branches:[...entries.values()].filter(e=>e.id!==rootId).map(e=>({id:e.id,parentId:e.parentId,label:e.label,anchor:e.anchor,meta:e.meta,nodes:e.nodes,running:e.binding.session.getSnapshot().running,hasMore:e.binding.session.getSnapshot().hasMore})),errors:[...errors.values()]});}
+  const entries=new Map(), pending=new Map(), errors=new Map(), retries=new Map(),retryTimers=new Set();
+  let emitTimer=null,published=false;
+  function publishNow(){emitTimer=null;if(!stopped){published=true;publish({ready:!!entries.get(rootId)?.meta,mainMeta:entries.get(rootId)?.meta,branches:[...entries.values()].filter(e=>e.id!==rootId).map(e=>({id:e.id,parentId:e.parentId,label:e.label,anchor:e.anchor,meta:e.meta,nodes:e.nodes,running:e.binding.session.getSnapshot().running,hasMore:e.binding.session.getSnapshot().hasMore})),errors:[...errors.values()]});}}
+  function emit(immediate=false){if(stopped)return;if(immediate===true||!published){clearTimeout(emitTimer);publishNow();}else if(emitTimer==null)emitTimer=setTimeout(publishNow,32);}
+  function retry(child,refresh,error){errors.set(child.id,`${child.label}: ${error.message}`);const count=retries.get(child.id)||0;if(count>=3)return;retries.set(child.id,count+1);const timer=setTimeout(()=>{retryTimers.delete(timer);if(stopped)return;errors.delete(child.id);refresh();},250*2**count);retryTimers.add(timer);}
   function attach(id,binding,parentId,label,anchor,reference){
     if(stopped){reference?.release();return;}
     const row={id,binding,parentId,label,anchor,reference,nodes:[],meta:null,cleanups:[]};entries.set(id,row);
@@ -12,7 +15,8 @@ function watchBranches(ctx,rootId,publish,buildNodes,contextSources){
     function refresh(){
       if(stopped)return;
       row.meta=metaSource.getSnapshot()||null;
-      row.nodes=buildNodes(target.getSnapshot(),id);
+      const snapshot=target.getSnapshot();
+      if(row.snapshot!==snapshot){row.nodes=id===rootId?[]:buildNodes(snapshot,id);row.snapshot=snapshot;}
       const children=row.meta?.children||[];
       for(const child of children){
         const existing=entries.get(child.id);
@@ -20,20 +24,20 @@ function watchBranches(ctx,rootId,publish,buildNodes,contextSources){
         if(pending.has(child.id)||errors.has(child.id)||child.id===rootId)continue;
         let ref;
         try{ref=ctx.sessions.retain({parentSessionId:id,childSessionId:child.id,mode:child.mode},{source:'controllerOperation'});}
-        catch(e){errors.set(child.id,`${child.label}: ${e.message}`);continue;}
+        catch(e){retry(child,refresh,e);continue;}
         pending.set(child.id,ref);
-        ref.ready.then(()=>{pending.delete(child.id);if(stopped)return;errors.delete(child.id);attach(child.id,ref.binding,id,child.label,child,ref);}).catch(e=>{pending.delete(child.id);if(stopped)return;ref.release();errors.set(child.id,`${child.label}: ${e.message}`);emit();});
+        ref.ready.then(()=>{pending.delete(child.id);if(stopped)return;errors.delete(child.id);retries.delete(child.id);attach(child.id,ref.binding,id,child.label,child,ref);emit(true);}).catch(e=>{pending.delete(child.id);if(stopped)return;ref.release();retry(child,refresh,e);emit();});
       }
       emit();
     }
     row.cleanups.push(metaSource.subscribe(refresh),target.subscribe(refresh),binding.session.subscribe(emit));
-    if(contextSources)row.cleanups.push(contextSources.subscribe(id,refresh));
+    if(contextSources)row.cleanups.push(contextSources.subscribe(id,()=>{row.snapshot=null;refresh();}));
     refresh();
   }
   const root=ctx.sessions.binding(rootId);
   if(root)attach(rootId,root,null,'主 Agent',null,null);
   else publish({branches:[],errors:['主会话尚未就绪']});
-  return ()=>{stopped=true;for(const row of entries.values()){for(const off of row.cleanups)off();row.reference?.release();}for(const ref of pending.values())ref.release();entries.clear();};
+  return ()=>{stopped=true;clearTimeout(emitTimer);for(const timer of retryTimers)clearTimeout(timer);for(const row of entries.values()){for(const off of row.cleanups)off();row.reference?.release();}for(const ref of pending.values())ref.release();entries.clear();};
 }
 
 function branchLayout(mainNodes,branches,width,graphLayout){

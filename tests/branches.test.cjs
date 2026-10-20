@@ -59,6 +59,17 @@ test('child subscriptions update live and every retained reference is released',
  const ctx={sessions:{binding:()=>rb,retain:()=>({binding:cb,ready:Promise.resolve(),release(){releases++;}})},uiConversation:{binding:id=>({target:()=>id==='root'?rootTarget:childTarget})}};
  const stop=watchBranches(ctx,'root',v=>last=v,s=>s);
  await new Promise(r=>setImmediate(r));a.equal(last.branches.length,1);a.equal(last.ready,true);
- childTarget.set([node('system:0',0,'system'),node('a',2,'assistant')]);a.equal(last.branches[0].nodes.length,2);
+ childTarget.set([node('system:0',0,'system'),node('a',2,'assistant')]);await new Promise(r=>setTimeout(r,45));a.equal(last.branches[0].nodes.length,2);
  stop();a.equal(releases,1);a.equal(childTarget.callbacks.size,0);a.equal(childMeta.callbacks.size,0);a.equal(rootMeta.callbacks.size,0);
+});
+test('transient child retain failure retries and coalesces burst notifications',async()=>{
+ let attempts=0,last,publishes=0,releases=0;
+ const meta=source({...initLineage({},0),children:[{id:'child',label:'child'}]}),childMeta=source(initLineage({},0)),target=source([]);
+ const binding=m=>({session:{projections:{faceOf:()=>m},getSnapshot:()=>({}),subscribe:()=>()=>{}}});
+ const root=binding(meta),child=binding(childMeta);
+ const stop=watchBranches({sessions:{binding:()=>root,retain:()=>{if(++attempts===1)throw new Error('temporary');return {ready:Promise.resolve(),binding:child,release(){releases++;}};}},uiConversation:{binding:()=>({target:()=>target})}},'root',v=>{last=v;publishes++;},s=>s);
+ await new Promise(r=>setTimeout(r,300));a.equal(attempts,2);a.equal(last.branches.length,1);a.equal(last.errors.length,0);
+ const before=publishes;for(let i=0;i<20;i++)target.set([]);
+ await new Promise(r=>setTimeout(r,45));a.equal(publishes-before,1);
+ stop();a.equal(releases,1);a.equal(target.callbacks.size,0);
 });
