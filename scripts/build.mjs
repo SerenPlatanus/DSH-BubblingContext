@@ -5,11 +5,13 @@ const model = await readFile(new URL('../src/trajectory.cjs', import.meta.url), 
 const branch = await readFile(new URL('../src/branches.cjs', import.meta.url), 'utf8');
 const graphState = await readFile(new URL('../src/graph-state.cjs', import.meta.url), 'utf8');
 const contextSource = await readFile(new URL('../src/context-source.cjs', import.meta.url), 'utf8');
+const renderWindow = await readFile(new URL('../src/render-window.cjs', import.meta.url), 'utf8');
 const source = (await readFile(new URL('../src/client.cjs', import.meta.url), 'utf8'))
   .replace("require('./trajectory.cjs')", `(() => { const module = { exports: {} };\n${model}\nreturn module.exports; })()`)
   .replace("require('./branches.cjs')", `(() => { const module = { exports: {} };\n${branch}\nreturn module.exports; })()`)
   .replace("require('./graph-state.cjs')", `(() => { const module = { exports: {} };\n${graphState}\nreturn module.exports; })()`)
-  .replace("require('./context-source.cjs')", `(() => { const module = { exports: {} };\n${contextSource}\nreturn module.exports; })()`);
+  .replace("require('./context-source.cjs')", `(() => { const module = { exports: {} };\n${contextSource}\nreturn module.exports; })()`)
+  .replace("require('./render-window.cjs')", `(() => { const module = { exports: {} };\n${renderWindow}\nreturn module.exports; })()`);
 const output = new URL('../lib/', import.meta.url);
 await mkdir(output, { recursive: true });
 await writeFile(new URL('client.js', output),
